@@ -1,23 +1,25 @@
-
+"""
+School Parent Membership System - Backend Server
+Flask + PostgreSQL Database
+Optimized for Render.com deployment
+"""
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import sqlite3
 import hashlib
 import secrets
-import json
 from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
-
-IS_RENDER = 'RENDER' in os.environ
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
 
-DATABASE = 'membership.db'
+# Determine if we're in production (Render)
+IS_RENDER = 'RENDER' in os.environ
 
 def get_db():
     """Get database connection - works with SQLite (local) and PostgreSQL (Render)"""
@@ -34,17 +36,19 @@ def get_db():
         
         try:
             conn = psycopg2.connect(db_url, cursor_factory=DictCursor)
-            print("Connected to PostgreSQL on Render")
+            print("✅ Connected to PostgreSQL on Render")
             return conn
         except Exception as e:
-            print(f"PostgreSQL connection failed: {e}")
+            print(f"❌ PostgreSQL connection failed: {e}")
             print("Falling back to SQLite...")
+            # Continue to SQLite fallback
     
     # SQLite (Local Development)
     import sqlite3
-    conn = sqlite3.connect('membership.db')
+    DATABASE = 'membership.db'
+    conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
-    print("Connected to SQLite (local development)")
+    print("✅ Connected to SQLite (local development)")
     return conn
 
 def init_db():
@@ -61,7 +65,7 @@ def init_db():
     
     print(f"📊 Initializing {db_type} database...")
     
-    # Members table (compatible with both SQLite and PostgreSQL)
+    # Members table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS members (
             id SERIAL PRIMARY KEY,
@@ -73,7 +77,7 @@ def init_db():
             password_hash TEXT NOT NULL,
             membership_type TEXT NOT NULL,
             expiry_date DATE NOT NULL,
-            status TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
             photo_url TEXT,
             points INTEGER DEFAULT 0,
             is_admin INTEGER DEFAULT 0,
@@ -81,54 +85,53 @@ def init_db():
         )
     ''')
     
-    # Family members table (for family packages)
+    # Family members table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS family_members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             primary_member_id INTEGER NOT NULL,
             member_number TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             relationship TEXT,
-            FOREIGN KEY (primary_member_id) REFERENCES members (id)
+            FOREIGN KEY (primary_member_id) REFERENCES members (id) ON DELETE CASCADE
         )
     ''')
     
     # Attendance table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             member_number TEXT NOT NULL,
             member_name TEXT NOT NULL,
             event_name TEXT,
             scanned_by TEXT,
-            timestamp TEXT NOT NULL,
+            timestamp TIMESTAMP NOT NULL,
             points_awarded INTEGER DEFAULT 10,
             status TEXT NOT NULL
         )
     ''')
     
-    # Sessions table (for login tokens)
+    # Sessions table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             email TEXT NOT NULL,
             token TEXT UNIQUE NOT NULL,
             role TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            expires_at TEXT NOT NULL
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL
         )
     ''')
-
+    
+    # Create indexes for performance
     if db_type == "PostgreSQL":
-        try:
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS citext")
-            cursor.execute("ALTER TABLE members ALTER COLUMN email TYPE citext")
-        except:
-            pass  # Ignore if extension not available
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_members_email ON members(email)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_member ON attendance(member_number)')
     
     conn.commit()
     conn.close()
-    print("✅ Database initialized successfully!")
+    print(f"✅ {db_type} database initialized successfully!")
 
 def hash_password(password):
     """Hash password using SHA256"""
@@ -143,12 +146,16 @@ def verify_token(token):
     conn = get_db()
     cursor = conn.cursor()
     
-    cursor.execute('''
+    # Use %s for PostgreSQL, ? for SQLite
+    param_style = '%s' if IS_RENDER else '?'
+    query = f'''
         SELECT s.email, s.role, m.first_name, m.surname, m.member_number, m.is_admin
         FROM sessions s
         LEFT JOIN members m ON s.email = m.email
-        WHERE s.token = ? AND s.expires_at > ?
-    ''', (token, datetime.now().isoformat()))
+        WHERE s.token = {param_style} AND s.expires_at > {param_style}
+    '''
+    
+    cursor.execute(query, (token, datetime.now().isoformat()))
     
     result = cursor.fetchone()
     conn.close()
@@ -163,6 +170,9 @@ def verify_token(token):
             'is_admin': result[5]
         }
     return None
+
+# Initialize database on startup
+init_db()
 
 # ============= API ROUTES =============
 
@@ -189,7 +199,6 @@ def import_excel():
     
     for member_data in data:
         try:
-            # Generate default password (email or member number)
             email = member_data.get('email', '').strip().lower()
             member_number = member_data.get('member_number', '').strip()
             
@@ -197,42 +206,87 @@ def import_excel():
                 errors.append(f"Missing email or member number for {member_data}")
                 continue
             
-            default_password = email  # Default password is their email
+            default_password = email
             password_hash = hash_password(default_password)
             
-            # Check if admin (is_admin column from Excel)
             is_admin = 1 if str(member_data.get('is_admin', '')).lower() in ['yes', 'true', '1', 'admin'] else 0
             
-            # Insert member
-            cursor.execute('''
-                INSERT OR REPLACE INTO members 
-                (member_number, first_name, surname, email, phone, password_hash, 
-                 membership_type, expiry_date, status, photo_url, points, is_admin)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-            ''', (
-                member_number,
-                member_data.get('first_name', '').strip(),
-                member_data.get('surname', '').strip(),
-                email,
-                member_data.get('phone', '').strip(),
-                password_hash,
-                member_data.get('membership_type', 'Solo'),
-                member_data.get('expiry_date', ''),
-                member_data.get('status', 'active'),
-                member_data.get('photo_url', 'https://ui-avatars.com/api/?name=' + member_data.get('first_name', 'U') + '+' + member_data.get('surname', 'U')),
-                is_admin
-            ))
+            # PostgreSQL uses %s, SQLite uses ?
+            if IS_RENDER:
+                cursor.execute('''
+                    INSERT INTO members 
+                    (member_number, first_name, surname, email, phone, password_hash, 
+                     membership_type, expiry_date, status, photo_url, points, is_admin)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s)
+                    ON CONFLICT (email) 
+                    DO UPDATE SET
+                        member_number = EXCLUDED.member_number,
+                        first_name = EXCLUDED.first_name,
+                        surname = EXCLUDED.surname,
+                        phone = EXCLUDED.phone,
+                        membership_type = EXCLUDED.membership_type,
+                        expiry_date = EXCLUDED.expiry_date,
+                        status = EXCLUDED.status,
+                        photo_url = EXCLUDED.photo_url,
+                        is_admin = EXCLUDED.is_admin
+                ''', (
+                    member_number,
+                    member_data.get('first_name', '').strip(),
+                    member_data.get('surname', '').strip(),
+                    email,
+                    member_data.get('phone', '').strip(),
+                    password_hash,
+                    member_data.get('membership_type', 'Solo'),
+                    member_data.get('expiry_date', ''),
+                    member_data.get('status', 'active'),
+                    member_data.get('photo_url', 'https://ui-avatars.com/api/?name=' + member_data.get('first_name', 'U') + '+' + member_data.get('surname', 'U')),
+                    is_admin
+                ))
+            else:
+                # SQLite version
+                cursor.execute('''
+                    INSERT OR REPLACE INTO members 
+                    (member_number, first_name, surname, email, phone, password_hash, 
+                     membership_type, expiry_date, status, photo_url, points, is_admin)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                ''', (
+                    member_number,
+                    member_data.get('first_name', '').strip(),
+                    member_data.get('surname', '').strip(),
+                    email,
+                    member_data.get('phone', '').strip(),
+                    password_hash,
+                    member_data.get('membership_type', 'Solo'),
+                    member_data.get('expiry_date', ''),
+                    member_data.get('status', 'active'),
+                    member_data.get('photo_url', 'https://ui-avatars.com/api/?name=' + member_data.get('first_name', 'U') + '+' + member_data.get('surname', 'U')),
+                    is_admin
+                ))
             
-            member_id = cursor.lastrowid
+            # Get member ID
+            cursor.execute('SELECT id FROM members WHERE email = %s' if IS_RENDER else 'SELECT id FROM members WHERE email = ?', (email,))
+            result = cursor.fetchone()
+            member_id = result[0] if result else None
             
-            # Insert family members if any
-            if 'family_members' in member_data and member_data['family_members']:
+            # Insert family members
+            if 'family_members' in member_data and member_data['family_members'] and member_id:
                 for fm in member_data['family_members']:
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO family_members 
-                        (primary_member_id, member_number, name, relationship)
-                        VALUES (?, ?, ?, ?)
-                    ''', (member_id, fm['member_number'], fm['name'], fm['relationship']))
+                    if IS_RENDER:
+                        cursor.execute('''
+                            INSERT INTO family_members 
+                            (primary_member_id, member_number, name, relationship)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (member_number) 
+                            DO UPDATE SET
+                                name = EXCLUDED.name,
+                                relationship = EXCLUDED.relationship
+                        ''', (member_id, fm['member_number'], fm['name'], fm['relationship']))
+                    else:
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO family_members 
+                            (primary_member_id, member_number, name, relationship)
+                            VALUES (?, ?, ?, ?)
+                        ''', (member_id, fm['member_number'], fm['name'], fm['relationship']))
             
             imported += 1
             
@@ -261,22 +315,20 @@ def login():
     conn = get_db()
     cursor = conn.cursor()
     
-    # Find member by email
-    cursor.execute('SELECT * FROM members WHERE email = ?', (email,))
+    # Find member by email - use correct parameter style
+    cursor.execute('SELECT * FROM members WHERE email = %s' if IS_RENDER else 'SELECT * FROM members WHERE email = ?', (email,))
     member = cursor.fetchone()
     
     if member and member['password_hash'] == hash_password(password):
-        # Determine role based on is_admin flag
         role = 'admin' if member['is_admin'] == 1 else 'member'
-        
-        # Create session token
         token = generate_token()
         expires_at = (datetime.now() + timedelta(days=30)).isoformat()
         
-        cursor.execute('''
-            INSERT INTO sessions (email, token, role, expires_at)
-            VALUES (?, ?, ?, ?)
-        ''', (email, token, role, expires_at))
+        cursor.execute(
+            'INSERT INTO sessions (email, token, role, expires_at) VALUES (%s, %s, %s, %s)' if IS_RENDER 
+            else 'INSERT INTO sessions (email, token, role, expires_at) VALUES (?, ?, ?, ?)', 
+            (email, token, role, expires_at)
+        )
         
         conn.commit()
         conn.close()
@@ -313,7 +365,7 @@ def get_member_profile():
     cursor = conn.cursor()
     
     # Get member details
-    cursor.execute('SELECT * FROM members WHERE email = ?', (user['email'],))
+    cursor.execute('SELECT * FROM members WHERE email = %s' if IS_RENDER else 'SELECT * FROM members WHERE email = ?', (user['email'],))
     member = cursor.fetchone()
     
     if not member:
@@ -322,20 +374,20 @@ def get_member_profile():
     # Get family members
     cursor.execute('''
         SELECT * FROM family_members 
-        WHERE primary_member_id = (SELECT id FROM members WHERE email = ?)
-    ''', (user['email'],))
+        WHERE primary_member_id = (SELECT id FROM members WHERE email = %s)
+    '''.replace('%s', '?' if not IS_RENDER else '%s'), (user['email'],))
     family_members = [dict(row) for row in cursor.fetchall()]
     
     # Get attendance history
     cursor.execute('''
         SELECT * FROM attendance 
-        WHERE member_number = ? OR member_number IN (
+        WHERE member_number = %s OR member_number IN (
             SELECT member_number FROM family_members 
-            WHERE primary_member_id = (SELECT id FROM members WHERE email = ?)
+            WHERE primary_member_id = (SELECT id FROM members WHERE email = %s)
         )
         ORDER BY timestamp DESC
         LIMIT 50
-    ''', (member['member_number'], user['email']))
+    '''.replace('%s', '?' if not IS_RENDER else '%s'), (member['member_number'], user['email']))
     attendance = [dict(row) for row in cursor.fetchall()]
     
     conn.close()
@@ -366,8 +418,8 @@ def scan_qr():
     cursor.execute('''
         SELECT m.*, m.first_name || ' ' || m.surname as full_name
         FROM members m
-        WHERE m.member_number = ?
-    ''', (scanned_member_number,))
+        WHERE m.member_number = %s
+    '''.replace('%s', '?' if not IS_RENDER else '%s'), (scanned_member_number,))
     
     member = cursor.fetchone()
     
@@ -377,8 +429,8 @@ def scan_qr():
             SELECT m.*, fm.name as full_name, fm.member_number as scanned_number
             FROM family_members fm
             JOIN members m ON fm.primary_member_id = m.id
-            WHERE fm.member_number = ?
-        ''', (scanned_member_number,))
+            WHERE fm.member_number = %s
+        '''.replace('%s', '?' if not IS_RENDER else '%s'), (scanned_member_number,))
         
         family_result = cursor.fetchone()
         if family_result:
@@ -404,8 +456,8 @@ def scan_qr():
     cursor.execute('''
         INSERT INTO attendance 
         (member_number, member_name, event_name, scanned_by, timestamp, points_awarded, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    '''.replace('%s', '?' if not IS_RENDER else '%s'), (
         scanned_member_number,
         member_name,
         event_name,
@@ -419,11 +471,11 @@ def scan_qr():
     if is_active:
         cursor.execute('''
             UPDATE members 
-            SET points = points + ? 
-            WHERE member_number = ? OR id = (
-                SELECT primary_member_id FROM family_members WHERE member_number = ?
+            SET points = points + %s 
+            WHERE member_number = %s OR id = (
+                SELECT primary_member_id FROM family_members WHERE member_number = %s
             )
-        ''', (points_awarded, scanned_member_number, scanned_member_number))
+        '''.replace('%s', '?' if not IS_RENDER else '%s'), (points_awarded, scanned_member_number, scanned_member_number))
     
     conn.commit()
     conn.close()
@@ -481,8 +533,8 @@ def get_all_attendance():
     cursor.execute('''
         SELECT * FROM attendance 
         ORDER BY timestamp DESC 
-        LIMIT ?
-    ''', (limit,))
+        LIMIT %s
+    '''.replace('%s', '?' if not IS_RENDER else '%s'), (limit,))
     
     attendance = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -509,8 +561,8 @@ def get_admin_stats():
     expiry_threshold = (datetime.now() + timedelta(days=30)).isoformat()
     cursor.execute('''
         SELECT COUNT(*) FROM members 
-        WHERE status = 'active' AND expiry_date <= ? AND expiry_date > ?
-    ''', (expiry_threshold, datetime.now().isoformat()))
+        WHERE status = 'active' AND expiry_date <= %s AND expiry_date > %s
+    '''.replace('%s', '?' if not IS_RENDER else '%s'), (expiry_threshold, datetime.now().isoformat()))
     expiring_soon = cursor.fetchone()[0]
     
     # Family vs Solo
@@ -524,8 +576,8 @@ def get_admin_stats():
     today = datetime.now().date().isoformat()
     cursor.execute('''
         SELECT COUNT(*) FROM attendance 
-        WHERE DATE(timestamp) = ?
-    ''', (today,))
+        WHERE DATE(timestamp) = %s
+    '''.replace('%s', '?' if not IS_RENDER else '%s'), (today,))
     today_attendance = cursor.fetchone()[0]
     
     # Total points awarded
@@ -559,9 +611,9 @@ def get_expiring_members():
     cursor.execute('''
         SELECT member_number, first_name, surname, email, expiry_date, membership_type
         FROM members 
-        WHERE status = 'active' AND expiry_date <= ? AND expiry_date > ?
+        WHERE status = 'active' AND expiry_date <= %s AND expiry_date > %s
         ORDER BY expiry_date ASC
-    ''', (expiry_threshold, datetime.now().isoformat()))
+    '''.replace('%s', '?' if not IS_RENDER else '%s'), (expiry_threshold, datetime.now().isoformat()))
     
     expiring_members = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -569,9 +621,6 @@ def get_expiring_members():
     return jsonify({'expiring_members': expiring_members})
 
 if __name__ == '__main__':
-    # Initialize database
-    init_db()
-    
     # Get port from environment (Render provides this)
     port = int(os.environ.get('PORT', 5000))
     
