@@ -1,8 +1,6 @@
-"""
-School Parent Membership System - Backend Server
-Flask + PostgreSQL Database
-Optimized for Render.com deployment
-"""
+import time
+print("🚀 Application starting...")
+time.sleep(2)  # Give time for environment to load
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -12,6 +10,21 @@ from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 
+@app.route('/health')
+def health():
+    return 'OK', 200
+
+@app.route('/env')
+def show_env():
+    """Debug endpoint to show environment variables"""
+    return {
+        'port': os.environ.get('PORT'),
+        'database_url': os.environ.get('DATABASE_URL'),
+        'python_version': os.sys.version,
+        'is_render': 'RENDER' in os.environ,
+        'timestamp': datetime.now().isoformat()
+    }
+    
 # Load environment variables
 load_dotenv()
 
@@ -603,15 +616,7 @@ def test():
     })
 
 if __name__ == '__main__':
-    # Get port from environment (Render provides this)
+    # For local development only
     port = int(os.environ.get('PORT', 5000))
-    
-    print("\n" + "="*60)
-    print("🎓 School Membership System")
-    print("="*60)
-    print(f"✅ Server starting on port {port}")
-    print("✅ Database: PostgreSQL" if IS_RENDER else "✅ Database: SQLite (local)")
-    print("✅ Ready to accept connections\n")
-    
-    # Run app
-    app.run(host='0.0.0.0', port=port, debug=not IS_RENDER)
+    print(f"🚀 Starting server on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=True)
